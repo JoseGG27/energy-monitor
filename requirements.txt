@@ -1,10 +1,6 @@
-requests==2.31.0
-pandas==2.1.4
-matplotlib==3.8.2
-plotly==5.18.0
-sqlalchemy==2.0.23
-python-dotenv==1.0.0
-schedule==1.2.1
-entsoe-py==0.6.8
-openpyxl==3.1.2
-streamlit==1.32.0
+requests
+pandas
+plotly
+python-dotenv
+streamlit
+openpyxl
