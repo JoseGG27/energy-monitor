@@ -43,6 +43,11 @@ def download_omie_day(target_date: date) -> pd.DataFrame | None:
         return None
 
     lines = r.text.splitlines()
+
+    # Detectar formato: horario (1,2,...,24) o cuartohorario (H1Q1,H1Q2,...,H24Q4)
+    header_row = next((l for l in lines if l.startswith(";")), None)
+    cuartohorario = header_row and "H1Q1" in header_row
+
     precio_es_row = next((l for l in lines if "espa" in l.lower() and "EUR" in l), None)
     precio_pt_row = next((l for l in lines if "portugu" in l.lower() and "EUR" in l), None)
 
@@ -50,22 +55,36 @@ def download_omie_day(target_date: date) -> pd.DataFrame | None:
         print(f"[OMIE] No se encontraron precios ES para {target_date}")
         return None
 
-    def parse_row(row: str) -> list:
-        parts = row.split(";")[1:]
+    def parse_all_values(row: str) -> list:
+        """Extrae todos los valores numéricos de una fila OMIE."""
         values = []
-        for p in parts:
+        for p in row.split(";")[1:]:
             p = p.strip().replace(",", ".").replace("\xa0", "").replace(" ", "")
             if p:
                 try:
                     values.append(float(p))
                 except ValueError:
                     pass
-            if len(values) == 24:   # OMIE incluye 4 sesiones x 24h; solo queremos la primera
-                break
         return values
 
-    precios_es = parse_row(precio_es_row)
-    precios_pt = parse_row(precio_pt_row) if precio_pt_row else [None] * len(precios_es)
+    def agrupar_por_hora(valores: list) -> list:
+        """Agrupa 96 cuartos de hora en 24 medias horarias."""
+        horas = []
+        for h in range(24):
+            cuartos = valores[h * 4 : h * 4 + 4]
+            horas.append(sum(cuartos) / len(cuartos) if cuartos else None)
+        return horas
+
+    raw_es = parse_all_values(precio_es_row)
+    raw_pt = parse_all_values(precio_pt_row) if precio_pt_row else []
+
+    if cuartohorario:
+        precios_es = agrupar_por_hora(raw_es)
+        precios_pt = agrupar_por_hora(raw_pt) if raw_pt else [None] * 24
+        print(f"[OMIE] Formato cuartohorario detectado — 96 intervalos agrupados a 24h")
+    else:
+        precios_es = raw_es[:24]
+        precios_pt = raw_pt[:24] if raw_pt else [None] * 24
 
     records = []
     for hora, (p_es, p_pt) in enumerate(zip(precios_es, precios_pt), start=1):
