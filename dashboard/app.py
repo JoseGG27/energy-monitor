@@ -13,6 +13,7 @@ import plotly.graph_objects as go
 import json
 from datetime import date, timedelta
 from collectors.omie_collector import download_omie_range
+from collectors.entsoe_collector import get_iberian_comparison
 
 # ── Configuración de página ──────────────────────────────────────────────────
 st.set_page_config(
@@ -270,6 +271,108 @@ if alerts_path.exists():
 else:
     st.info("Ejecuta primero `python main.py --mode omie` para generar alertas.")
 
+
+# ── Comparativa ENTSO-E: ES / FR / DE ────────────────────────────────────────
 st.markdown("---")
-st.caption("Datos: OMIE (mercado ibérico) · Peajes y cargos: CNMC 2026 (ajustables en sidebar) · "
-           "Desarrollado con Streamlit + Plotly")
+st.subheader("🌍 Comparativa de precios europeos — ENTSO-E (ES / FR / DE)")
+
+from config.settings import ENTSOE_TOKEN
+
+if not ENTSOE_TOKEN:
+    st.info("🔑 Token ENTSO-E no configurado. Añádelo en los **Secrets** de Streamlit Cloud para activar esta sección.")
+else:
+    @st.cache_data(ttl=3600)
+    def load_entsoe(days: int) -> pd.DataFrame:
+        today = date.today()
+        start = today - timedelta(days=days)
+        end   = today - timedelta(days=1)
+        try:
+            return get_iberian_comparison(start, end)
+        except Exception as e:
+            return pd.DataFrame()
+
+    with st.spinner("Cargando datos ENTSO-E (ES/FR/DE)..."):
+        df_entsoe = load_entsoe(days)
+
+    if df_entsoe.empty:
+        st.warning("No se pudieron obtener datos de ENTSO-E para este período.")
+    else:
+        df_entsoe["datetime"] = pd.to_datetime(df_entsoe["datetime"])
+        df_entsoe["hora_num"] = df_entsoe["datetime"].dt.hour
+
+        COLORES = {"ES": "#4fc3f7", "FR": "#81c784", "DE": "#ffb74d"}
+
+        # ── KPIs por país ─────────────────────────────────────────────────────
+        stats = df_entsoe.groupby("country")["precio_eur_mwh"].agg(["mean", "min", "max"]).round(1)
+        cols = st.columns(len(stats))
+        for i, (pais, row) in enumerate(stats.iterrows()):
+            flag = {"ES": "🇪🇸", "FR": "🇫🇷", "DE": "🇩🇪"}.get(pais, "")
+            cols[i].metric(f"{flag} {pais} — Precio medio", f"{row['mean']:.1f} €/MWh",
+                           f"Min {row['min']:.1f} · Max {row['max']:.1f}")
+
+        # ── Gráfico líneas comparativo ─────────────────────────────────────────
+        fig_eu = go.Figure()
+        for pais, grp in df_entsoe.groupby("country"):
+            grp_sorted = grp.sort_values("datetime")
+            fig_eu.add_trace(go.Scatter(
+                x=grp_sorted["datetime"],
+                y=grp_sorted["precio_eur_mwh"],
+                mode="lines", name=pais,
+                line=dict(color=COLORES.get(pais, "#fff"), width=1.5),
+                hovertemplate=f"<b>{pais}</b> %{{x|%d %b %H:%M}}<br>%{{y:.1f}} €/MWh<extra></extra>",
+            ))
+        fig_eu.update_layout(
+            height=360, margin=dict(l=0, r=0, t=10, b=0),
+            xaxis_title=None, yaxis_title="EUR/MWh",
+            hovermode="x unified", template="plotly_dark",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_eu, use_container_width=True)
+
+        # ── Perfil horario medio por país ──────────────────────────────────────
+        col_eu1, col_eu2 = st.columns(2)
+
+        with col_eu1:
+            st.markdown("**Perfil horario medio por país**")
+            hourly_eu = df_entsoe.groupby(["country", "hora_num"])["precio_eur_mwh"].mean().reset_index()
+            fig_heu = go.Figure()
+            for pais, grp in hourly_eu.groupby("country"):
+                fig_heu.add_trace(go.Scatter(
+                    x=grp["hora_num"], y=grp["precio_eur_mwh"],
+                    mode="lines+markers", name=pais,
+                    line=dict(color=COLORES.get(pais, "#fff"), width=2),
+                    hovertemplate=f"{pais} hora %{{x}}h: %{{y:.1f}} €/MWh<extra></extra>",
+                ))
+            fig_heu.update_layout(
+                height=300, template="plotly_dark",
+                margin=dict(l=0, r=0, t=10, b=0),
+                xaxis_title="Hora del día", yaxis_title="EUR/MWh",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_heu, use_container_width=True)
+
+        with col_eu2:
+            st.markdown("**Tabla resumen por país**")
+            resumen = df_entsoe.groupby("country")["precio_eur_mwh"].agg(
+                Media="mean", Mínimo="min", Máximo="max",
+                Volatilidad="std",
+                Horas_negativas=lambda x: (x < 0).sum(),
+            ).round(1).reset_index()
+            resumen.columns = ["País", "Media (€/MWh)", "Mín.", "Máx.", "Volatilidad", "Horas < 0€"]
+            resumen["País"] = resumen["País"].map({"ES": "🇪🇸 España", "FR": "🇫🇷 Francia", "DE": "🇩🇪 Alemania"})
+            st.dataframe(resumen, use_container_width=True, hide_index=True)
+
+            # Diferencial ES vs FR y DE
+            st.markdown("**Diferencial ES respecto a vecinos**")
+            if "ES" in stats.index and "FR" in stats.index:
+                diff_fr = stats.loc["ES", "mean"] - stats.loc["FR", "mean"]
+                arrow_fr = "↑ más caro" if diff_fr > 0 else "↓ más barato"
+                st.markdown(f"- ES vs FR: `{diff_fr:+.1f} €/MWh` ({arrow_fr})")
+            if "ES" in stats.index and "DE" in stats.index:
+                diff_de = stats.loc["ES", "mean"] - stats.loc["DE", "mean"]
+                arrow_de = "↑ más caro" if diff_de > 0 else "↓ más barato"
+                st.markdown(f"- ES vs DE: `{diff_de:+.1f} €/MWh` ({arrow_de})")
+
+st.markdown("---")
+st.caption("Datos: OMIE (mercado ibérico) · ENTSO-E (precios europeos) · "
+           "Peajes y cargos: CNMC 2026 (ajustables en sidebar) · Desarrollado con Streamlit + Plotly")
