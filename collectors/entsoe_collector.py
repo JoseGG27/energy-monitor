@@ -72,7 +72,13 @@ def get_day_ahead_prices(country: str, start: date, end: date) -> pd.DataFrame:
     if not records:
         return pd.DataFrame()
 
-    df = pd.DataFrame(records).sort_values("datetime")
+    df = pd.DataFrame(records)
+    # Normalizar timezone UTC → local y eliminar duplicados (ENTSO-E devuelve múltiples TimeSeries)
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    df = df.sort_values("datetime")
+    # Quedarse con el último precio publicado por hora (el más actualizado)
+    df = df.drop_duplicates(subset=["datetime", "country"], keep="last").reset_index(drop=True)
+
     out_path = DATA_RAW_DIR / f"entsoe_{country}_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}.csv"
     df.to_csv(out_path, index=False)
     print(f"[ENTSO-E] {country}: {len(df)} registros guardados")
