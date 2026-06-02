@@ -1,0 +1,27 @@
+# Credenciales — NUNCA subir al repo
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Datos crudos descargados
+data/raw/*.csv
+data/processed/*.csv
+data/processed/*.json
+data/*.db
+
+# VS Code
+.vscode/
+
+# Sistema
+.DS_Store
+Thumbs.db
