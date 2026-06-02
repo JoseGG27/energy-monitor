@@ -60,6 +60,8 @@ def download_omie_day(target_date: date) -> pd.DataFrame | None:
                     values.append(float(p))
                 except ValueError:
                     pass
+            if len(values) == 24:   # OMIE incluye 4 sesiones x 24h; solo queremos la primera
+                break
         return values
 
     precios_es = parse_row(precio_es_row)
