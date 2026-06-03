@@ -1,12 +1,12 @@
 """
-Script de refresco de datos — ejecutar localmente con tus tokens.
+Script de refresco de datos - ejecutar localmente con tus tokens.
 
-Descarga los últimos N días de ESIOS y ENTSO-E, guarda los CSVs
-en data/raw/ y los sube automáticamente a GitHub para que
+Descarga los ultimos N dias de ESIOS y ENTSO-E, guarda los CSVs
+en data/raw/ y los sube automaticamente a GitHub para que
 Streamlit Cloud los sirva sin llamar a las APIs directamente.
 
 Uso:
-    python refresh_data.py          # últimos 7 días
+    python refresh_data.py          # ultimos 7 dias
     python refresh_data.py --days 30
     python refresh_data.py --dry-run  # descarga pero no sube a GitHub
 """
@@ -20,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 
 def run(cmd: str) -> int:
-    """Ejecuta un comando de shell y devuelve el código de salida."""
+    """Ejecuta un comando de shell y devuelve el codigo de salida."""
     print(f"\n$ {cmd}")
     result = subprocess.run(cmd, shell=True, cwd=BASE_DIR)
     return result.returncode
@@ -31,7 +31,7 @@ def download_esios(start: date, end: date):
     from config.settings import ESIOS_TOKEN
 
     if not ESIOS_TOKEN:
-        print("[ESIOS] Token no configurado — omitiendo.")
+        print("[ESIOS] Token no configurado - omitiendo.")
         return
 
     print(f"\n=== ESIOS ({start} -> {end}) ===")
@@ -53,7 +53,7 @@ def download_entsoe(start: date, end: date):
     from config.settings import ENTSOE_TOKEN
 
     if not ENTSOE_TOKEN:
-        print("[ENTSO-E] Token no configurado — omitiendo.")
+        print("[ENTSO-E] Token no configurado - omitiendo.")
         return
 
     print(f"\n=== ENTSO-E ES/FR/DE ({start} -> {end}) ===")
@@ -76,26 +76,26 @@ def push_to_github(days: int):
     result = subprocess.run("git status --porcelain data/raw/",
                             shell=True, capture_output=True, text=True, cwd=BASE_DIR)
     if not result.stdout.strip():
-        print("\n✅ No hay cambios nuevos en data/raw/ — nada que subir.")
+        print("\n[OK] No hay cambios nuevos en data/raw/ - nada que subir.")
         return
 
     cmds = [
         "git add data/raw/esios_*.csv data/raw/entsoe_*.csv",
-        f'git commit -m "data: refresco automático {hoy} (últimos {days} días)"',
+        f'git commit -m "data: refresco automatico {hoy} (ultimos {days} dias)"',
         "git push",
     ]
     for cmd in cmds:
         code = run(cmd)
         if code != 0:
-            print(f"\n[ERROR] Falló: {cmd}")
+            print(f"\n[ERROR] Fallo: {cmd}")
             sys.exit(code)
 
-    print(f"\n✅ Datos subidos a GitHub — Streamlit Cloud se actualizará en ~1 min.")
+    print(f"\n[OK] Datos subidos a GitHub - Streamlit Cloud se actualizara en ~1 min.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Refresco de datos ESIOS + ENTSO-E")
-    parser.add_argument("--days",    type=int, default=7,    help="Días hacia atrás a descargar")
+    parser.add_argument("--days",    type=int, default=7,    help="Dias hacia atras a descargar")
     parser.add_argument("--dry-run", action="store_true",    help="Descarga pero no sube a GitHub")
     args = parser.parse_args()
 
@@ -104,7 +104,7 @@ def main():
     end   = today - timedelta(days=1)
 
     print(f"{'='*55}")
-    print(f"  REFRESCO DE DATOS — {today}")
+    print(f"  REFRESCO DE DATOS - {today}")
     print(f"  Periodo: {start} -> {end}  ({args.days} dias)")
     print(f"{'='*55}")
 
