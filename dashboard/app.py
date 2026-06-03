@@ -54,6 +54,33 @@ st.sidebar.markdown("**Sesión de carga EV**")
 kwh_sesion = st.sidebar.number_input("kWh por sesión", value=50.0, step=5.0,
                                       help="Energía media por sesión de carga")
 
+# ── Carga ESIOS (CSVs locales subidos por refresh_data.py) ───────────────────
+@st.cache_data(ttl=3600)
+def load_esios(days: int):
+    raw_dir = Path(__file__).parent.parent / "data" / "raw"
+    today   = date.today()
+    start   = today - timedelta(days=days)
+
+    def _load_indicator(prefix: str) -> pd.DataFrame:
+        files = sorted(raw_dir.glob(f"{prefix}_*.csv"))
+        if not files:
+            return pd.DataFrame()
+        df = pd.read_csv(files[-1])   # el más reciente
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+        df = df[df["datetime"] >= pd.Timestamp(start)]
+        # Agregar múltiples registros por hora -> media horaria
+        df["hora"] = df["datetime"].dt.floor("h")
+        df = df.groupby("hora")["precio_eur_mwh"].mean().reset_index()
+        df.columns = ["datetime", "precio_eur_mwh"]
+        return df.sort_values("datetime")
+
+    spot = _load_indicator("esios_600")
+    pvpc = _load_indicator("esios_1001")
+    return spot, pvpc
+
+df_esios_spot, df_esios_pvpc = load_esios(days)
+tiene_esios = not df_esios_spot.empty or not df_esios_pvpc.empty
+
 # ── Función de coste total ────────────────────────────────────────────────────
 def coste_total_eur_mwh(spot: float) -> float:
     """Calcula el coste total €/MWh: spot + peajes + cargos + impuestos."""
@@ -129,13 +156,27 @@ fig_line.add_hrect(y0=umbral_alto, y1=df["coste_total_eur_mwh"].max() + 5,
 
 fig_line.add_trace(go.Scatter(
     x=df["fecha"], y=df[price_col],
-    mode="lines", name="Precio spot (OMIE)",
+    mode="lines", name="Spot OMIE",
     line=dict(color="#4fc3f7", width=1.5),
-    hovertemplate="<b>%{x|%d %b %H:%M}</b><br>Spot: %{y:.1f} €/MWh<extra></extra>",
+    hovertemplate="<b>%{x|%d %b %H:%M}</b><br>OMIE: %{y:.1f} €/MWh<extra></extra>",
 ))
+if not df_esios_spot.empty:
+    fig_line.add_trace(go.Scatter(
+        x=df_esios_spot["datetime"], y=df_esios_spot["precio_eur_mwh"],
+        mode="lines", name="Spot ESIOS (REE)",
+        line=dict(color="#ce93d8", width=1.5, dash="dash"),
+        hovertemplate="<b>%{x|%d %b %H:%M}</b><br>ESIOS: %{y:.1f} €/MWh<extra></extra>",
+    ))
+if not df_esios_pvpc.empty:
+    fig_line.add_trace(go.Scatter(
+        x=df_esios_pvpc["datetime"], y=df_esios_pvpc["precio_eur_mwh"],
+        mode="lines", name="PVPC (tarifa regulada)",
+        line=dict(color="#a5d6a7", width=1.5, dash="dot"),
+        hovertemplate="<b>%{x|%d %b %H:%M}</b><br>PVPC: %{y:.1f} €/MWh<extra></extra>",
+    ))
 fig_line.add_trace(go.Scatter(
     x=df["fecha"], y=df["coste_total_eur_mwh"],
-    mode="lines", name="Coste total (con peajes+IVA)",
+    mode="lines", name="Coste total (spot+peajes+IVA)",
     line=dict(color="#ffb74d", width=1.5, dash="dot"),
     hovertemplate="<b>%{x|%d %b %H:%M}</b><br>Total: %{y:.1f} €/MWh<extra></extra>",
 ))
@@ -271,6 +312,82 @@ if alerts_path.exists():
 else:
     st.info("Ejecuta primero `python main.py --mode omie` para generar alertas.")
 
+
+# ── Sección ESIOS: Spot REE + PVPC ───────────────────────────────────────────
+st.markdown("---")
+st.subheader("🔌 ESIOS (REE) — Precio Spot y PVPC")
+
+if not tiene_esios:
+    st.info("Sin datos ESIOS. Ejecuta `python refresh_data.py` para descargarlos.")
+else:
+    # KPIs ESIOS
+    kpi_cols = st.columns(4)
+    if not df_esios_spot.empty:
+        kpi_cols[0].metric("Spot ESIOS medio", f"{df_esios_spot['precio_eur_mwh'].mean():.1f} €/MWh")
+        kpi_cols[1].metric("Spot ESIOS máx.",  f"{df_esios_spot['precio_eur_mwh'].max():.1f} €/MWh")
+    if not df_esios_pvpc.empty:
+        kpi_cols[2].metric("PVPC medio",       f"{df_esios_pvpc['precio_eur_mwh'].mean():.1f} €/MWh")
+        kpi_cols[3].metric("PVPC máx.",        f"{df_esios_pvpc['precio_eur_mwh'].max():.1f} €/MWh")
+
+    # Gráfico PVPC vs Spot OMIE vs Spot ESIOS
+    fig_esios = go.Figure()
+    fig_esios.add_trace(go.Scatter(
+        x=df["fecha"], y=df[price_col],
+        mode="lines", name="Spot OMIE",
+        line=dict(color="#4fc3f7", width=1.5),
+        hovertemplate="OMIE %{x|%d %b %H:%M}: %{y:.1f} €/MWh<extra></extra>",
+    ))
+    if not df_esios_spot.empty:
+        fig_esios.add_trace(go.Scatter(
+            x=df_esios_spot["datetime"], y=df_esios_spot["precio_eur_mwh"],
+            mode="lines", name="Spot ESIOS (REE)",
+            line=dict(color="#ce93d8", width=1.5, dash="dash"),
+            hovertemplate="ESIOS %{x|%d %b %H:%M}: %{y:.1f} €/MWh<extra></extra>",
+        ))
+    if not df_esios_pvpc.empty:
+        fig_esios.add_trace(go.Scatter(
+            x=df_esios_pvpc["datetime"], y=df_esios_pvpc["precio_eur_mwh"],
+            mode="lines", name="PVPC (tarifa regulada)",
+            line=dict(color="#a5d6a7", width=2),
+            hovertemplate="PVPC %{x|%d %b %H:%M}: %{y:.1f} €/MWh<extra></extra>",
+        ))
+    fig_esios.update_layout(
+        height=360, margin=dict(l=0, r=0, t=10, b=0),
+        xaxis_title=None, yaxis_title="EUR/MWh",
+        hovermode="x unified", template="plotly_dark",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig_esios, use_container_width=True)
+
+    # Tabla comparativa horaria PVPC vs Spot OMIE
+    if not df_esios_pvpc.empty:
+        st.markdown("**Comparativa horaria: PVPC vs Spot OMIE**")
+        df_esios_pvpc_h = df_esios_pvpc.copy()
+        df_esios_pvpc_h["hora"] = df_esios_pvpc_h["datetime"].dt.hour
+        pvpc_horario = df_esios_pvpc_h.groupby("hora")["precio_eur_mwh"].mean().reset_index()
+        pvpc_horario.columns = ["Hora", "PVPC medio (€/MWh)"]
+
+        omie_horario = df.groupby("hora_num")[price_col].mean().reset_index()
+        omie_horario.columns = ["Hora", "Spot OMIE (€/MWh)"]
+
+        tabla_comp = pvpc_horario.merge(omie_horario, on="Hora")
+        tabla_comp["Diferencia PVPC-OMIE"] = (tabla_comp["PVPC medio (€/MWh)"] - tabla_comp["Spot OMIE (€/MWh)"]).round(2)
+        tabla_comp["PVPC medio (€/MWh)"]  = tabla_comp["PVPC medio (€/MWh)"].round(2)
+        tabla_comp["Spot OMIE (€/MWh)"]   = tabla_comp["Spot OMIE (€/MWh)"].round(2)
+
+        col_t1, col_t2 = st.columns([2, 1])
+        with col_t1:
+            st.dataframe(tabla_comp, use_container_width=True, hide_index=True, height=280)
+        with col_t2:
+            diff_media = tabla_comp["Diferencia PVPC-OMIE"].mean()
+            st.metric("Diferencia media PVPC vs Spot",
+                      f"{diff_media:+.1f} €/MWh",
+                      help="Positivo = PVPC más caro que el spot de mercado")
+            pvpc_kwh = df_esios_pvpc["precio_eur_mwh"].mean() / 1000
+            st.metric("PVPC medio en €/kWh", f"{pvpc_kwh:.4f} €/kWh")
+            coste_pvpc_sesion = pvpc_kwh * kwh_sesion
+            st.metric(f"Coste sesión EV ({kwh_sesion:.0f} kWh) a PVPC",
+                      f"{coste_pvpc_sesion:.2f} €")
 
 # ── Comparativa ENTSO-E: ES / FR / DE ────────────────────────────────────────
 st.markdown("---")
