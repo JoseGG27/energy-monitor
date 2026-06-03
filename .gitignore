@@ -13,8 +13,10 @@ build/
 venv/
 env/
 
-# Datos crudos descargados
-data/raw/*.csv
+# Datos OMIE: se descargan en tiempo real en Streamlit, no hace falta subirlos
+data/raw/omie_*.csv
+
+# Datos procesados locales
 data/processed/*.csv
 data/processed/*.json
 data/*.db
