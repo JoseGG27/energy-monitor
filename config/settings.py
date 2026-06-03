@@ -23,7 +23,7 @@ ESIOS_INDICATOR_SPOT = 600
 ENTSOE_BASE_URL = "https://web-api.tp.entsoe.eu/api"
 ENTSOE_AREA_ES  = "10YES-REE------0"
 ENTSOE_AREA_FR  = "10YFR-RTE------C"
-ENTSOE_AREA_DE  = "10Y1001A1001A83F"
+ENTSOE_AREA_DE  = "10Y1001A1001A82H"   # DE-LU (correcto desde 2018)
 
 # --- Almacenamiento local ---
 DATA_RAW_DIR       = BASE_DIR / "data" / "raw"

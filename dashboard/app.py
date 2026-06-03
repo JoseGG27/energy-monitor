@@ -1,6 +1,6 @@
 """
-Dashboard público de precios eléctricos — energy-monitor
-Ejecutar localmente:  streamlit run dashboard/app.py
+Dashboard de precios electricos — energy-monitor
+https://ev-energy-monitor.streamlit.app
 """
 import sys
 from pathlib import Path
@@ -14,482 +14,463 @@ import json
 from datetime import date, timedelta
 from collectors.omie_collector import download_omie_range
 from collectors.entsoe_collector import get_iberian_comparison
+from config.settings import ENTSOE_TOKEN
 
-# ── Configuración de página ──────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Monitor Precios Eléctricos",
+    page_title="Monitor Precios Electricos",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════
+#  SIDEBAR
+# ════════════════════════════════════════════════════════
 st.sidebar.title("⚡ Energy Monitor")
-st.sidebar.markdown("Precios mercado ibérico (OMIE)")
 
-days = st.sidebar.slider("Días a mostrar", min_value=1, max_value=30, value=7)
-country = st.sidebar.radio("País", ["España (ES)", "Portugal (PT)"], index=0)
-price_col = "precio_es" if "España" in country else "precio_pt"
+st.sidebar.markdown("### Periodo")
+days = st.sidebar.slider("Dias a mostrar", 1, 30, 7)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Umbrales de alerta**")
-umbral_alto = st.sidebar.number_input("Precio alto (EUR/MWh)", value=150.0, step=5.0)
-umbral_bajo = st.sidebar.number_input("Precio bajo (EUR/MWh)", value=20.0, step=5.0)
+st.sidebar.markdown("### Paises")
+paises_opciones = {"España 🇪🇸": "ES", "Portugal 🇵🇹": "PT"}
+if ENTSOE_TOKEN:
+    paises_opciones.update({"Francia 🇫🇷": "FR", "Alemania 🇩🇪": "DE"})
+paises_sel = st.sidebar.multiselect(
+    "Selecciona paises",
+    list(paises_opciones.keys()),
+    default=["España 🇪🇸"],
+)
+if not paises_sel:
+    st.sidebar.warning("Selecciona al menos un pais.")
+    st.stop()
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Costes del sistema (€/MWh)**")
-st.sidebar.caption("Cargos regulados que se suman al precio spot")
-peaje_acceso   = st.sidebar.number_input("Peaje de acceso",     value=25.0, step=1.0,
-                                          help="Peajes de transporte y distribución (CNMC 2026)")
-cargos_sistema = st.sidebar.number_input("Cargos del sistema",  value=18.0, step=1.0,
-                                          help="Cargos regulados: renovables, extrapeninsular, etc.")
-st.sidebar.markdown("**Impuestos**")
-imp_electrico  = st.sidebar.number_input("Impuesto eléctrico (%)", value=5.11, step=0.1,
-                                          help="Impuesto sobre la electricidad (Ley 38/1992)")
-iva            = st.sidebar.number_input("IVA (%)", value=21.0, step=1.0,
-                                          help="IVA aplicable a la factura eléctrica")
+paises_cod = [paises_opciones[p] for p in paises_sel]
+price_col  = "precio_es" if "ES" in paises_cod else "precio_pt"
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Sesión de carga EV**")
-kwh_sesion = st.sidebar.number_input("kWh por sesión", value=50.0, step=5.0,
-                                      help="Energía media por sesión de carga")
+st.sidebar.markdown("### Costes regulados (EUR/MWh)")
+peaje_acceso   = st.sidebar.number_input("Peaje de acceso",    value=25.0, step=1.0)
+cargos_sistema = st.sidebar.number_input("Cargos del sistema", value=18.0, step=1.0)
+imp_electrico  = st.sidebar.number_input("Impuesto electrico (%)", value=5.11, step=0.1)
+iva            = st.sidebar.number_input("IVA (%)", value=21.0, step=1.0)
 
-# ── Carga ESIOS (CSVs locales subidos por refresh_data.py) ───────────────────
+st.sidebar.markdown("### Sesion de carga EV")
+kwh_sesion = st.sidebar.number_input("kWh por sesion", value=50.0, step=5.0)
+
+COLORES = {"ES": "#4fc3f7", "PT": "#81d4fa", "FR": "#81c784", "DE": "#ffb74d"}
+FLAGS   = {"ES": "🇪🇸", "PT": "🇵🇹", "FR": "🇫🇷", "DE": "🇩🇪"}
+
+def coste_total(spot: float) -> float:
+    base = max(spot, 0) + peaje_acceso + cargos_sistema
+    return base * (1 + imp_electrico / 100) * (1 + iva / 100)
+
+# ════════════════════════════════════════════════════════
+#  CARGA DE DATOS
+# ════════════════════════════════════════════════════════
+today = date.today()
+start = today - timedelta(days=days)
+end   = today - timedelta(days=1)
+
 @st.cache_data(ttl=3600)
-def load_esios(days: int):
-    raw_dir = Path(__file__).parent.parent / "data" / "raw"
-    today   = date.today()
-    start   = today - timedelta(days=days)
-
-    def _load_indicator(prefix: str) -> pd.DataFrame:
-        files = sorted(raw_dir.glob(f"{prefix}_*.csv"))
-        if not files:
-            return pd.DataFrame()
-        df = pd.read_csv(files[-1])   # el más reciente
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
-        df = df[df["datetime"] >= pd.Timestamp(start)]
-        # Agregar múltiples registros por hora -> media horaria
-        df["hora"] = df["datetime"].dt.floor("h")
-        df = df.groupby("hora")["precio_eur_mwh"].mean().reset_index()
-        df.columns = ["datetime", "precio_eur_mwh"]
-        return df.sort_values("datetime")
-
-    spot = _load_indicator("esios_600")
-    pvpc = _load_indicator("esios_1001")
-    return spot, pvpc
-
-df_esios_spot, df_esios_pvpc = load_esios(days)
-tiene_esios = not df_esios_spot.empty or not df_esios_pvpc.empty
-
-# ── Función de coste total ────────────────────────────────────────────────────
-def coste_total_eur_mwh(spot: float) -> float:
-    """Calcula el coste total €/MWh: spot + peajes + cargos + impuestos."""
-    base   = max(spot, 0) + peaje_acceso + cargos_sistema   # precio negativo no reduce peajes
-    con_ie = base * (1 + imp_electrico / 100)
-    con_iva = con_ie * (1 + iva / 100)
-    return con_iva
-
-# ── Carga de datos ───────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600)
-def load_data(days: int) -> pd.DataFrame:
+def load_omie(days):
     today = date.today()
     start = today - timedelta(days=days)
     end   = today - timedelta(days=1)
     raw_dir = Path(__file__).parent.parent / "data" / "raw"
-    frames = []
-    for d in pd.date_range(start, end):
-        p = raw_dir / f"omie_{d.strftime('%Y%m%d')}.csv"
-        if p.exists():
-            frames.append(pd.read_csv(p, parse_dates=["fecha"]))
-    if frames:
-        return pd.concat(frames, ignore_index=True).sort_values("fecha")
-    return download_omie_range(start, end)
+    frames = [pd.read_csv(f, parse_dates=["fecha"])
+              for d in pd.date_range(start, end)
+              if (f := raw_dir / f"omie_{d.strftime('%Y%m%d')}.csv").exists()]
+    return (pd.concat(frames, ignore_index=True).sort_values("fecha")
+            if frames else download_omie_range(start, end))
 
-with st.spinner("Cargando datos de OMIE..."):
-    df = load_data(days)
+@st.cache_data(ttl=3600)
+def load_esios_csvs(days):
+    raw_dir = Path(__file__).parent.parent / "data" / "raw"
+    today   = date.today()
+    cutoff  = pd.Timestamp(today - timedelta(days=days))
+    def _read(prefix):
+        files = sorted(raw_dir.glob(f"{prefix}_*.csv"))
+        if not files:
+            return pd.DataFrame()
+        df = pd.read_csv(files[-1])
+        df["datetime"] = (pd.to_datetime(df["datetime"], utc=True)
+                          .dt.tz_convert("Europe/Madrid").dt.tz_localize(None))
+        df = df[df["datetime"] >= cutoff]
+        df["hora"] = df["datetime"].dt.floor("h")
+        return (df.groupby("hora")["precio_eur_mwh"].mean()
+                  .reset_index().rename(columns={"hora": "datetime"})
+                  .sort_values("datetime"))
+    return _read("esios_600"), _read("esios_1001")
 
-if df.empty:
-    st.error("No hay datos disponibles para el período seleccionado.")
+@st.cache_data(ttl=3600)
+def load_entsoe(days):
+    if not ENTSOE_TOKEN:
+        return pd.DataFrame()
+    today = date.today()
+    try:
+        return get_iberian_comparison(today - timedelta(days=days), today - timedelta(days=1))
+    except Exception:
+        return pd.DataFrame()
+
+with st.spinner("Cargando datos..."):
+    df_omie      = load_omie(days)
+    df_esios_spot, df_esios_pvpc = load_esios_csvs(days)
+    df_entsoe    = load_entsoe(days)
+
+if df_omie.empty:
+    st.error("Sin datos OMIE disponibles.")
     st.stop()
 
-df["fecha"]    = pd.to_datetime(df["fecha"])
-df["dia"]      = df["fecha"].dt.date
-df["hora_num"] = df["hora"].astype(int)
+df_omie["fecha"]    = pd.to_datetime(df_omie["fecha"])
+df_omie["dia"]      = df_omie["fecha"].dt.date
+df_omie["hora_num"] = df_omie["hora"].astype(int)
+df_omie["coste_total"] = df_omie[price_col].apply(coste_total)
 
-# Calcular columna de coste total para cada registro
-df["coste_total_eur_mwh"] = df[price_col].apply(coste_total_eur_mwh)
-df["coste_total_eur_kwh"] = df["coste_total_eur_mwh"] / 1000
+if not df_entsoe.empty:
+    df_entsoe["datetime"] = pd.to_datetime(df_entsoe["datetime"])
+    df_entsoe["hora_num"] = df_entsoe["datetime"].dt.hour
+    df_entsoe = df_entsoe[df_entsoe["country"].isin(paises_cod)]
 
-# ── Título ───────────────────────────────────────────────────────────────────
-st.title("⚡ Monitor de Precios Eléctricos — Mercado Ibérico")
-st.caption(f"Fuente: OMIE  |  Período: {df['dia'].min()} → {df['dia'].max()}  |  {len(df)} registros")
+# ════════════════════════════════════════════════════════
+#  CABECERA
+# ════════════════════════════════════════════════════════
+st.title("⚡ Monitor de Precios Electricos")
+c1, c2, c3 = st.columns(3)
+c1.caption(f"**Periodo:** {df_omie['dia'].min()} → {df_omie['dia'].max()}")
+c2.caption(f"**Fuentes:** OMIE {'· ESIOS' if not df_esios_spot.empty else ''} {'· ENTSO-E' if not df_entsoe.empty else ''}")
+c3.caption(f"**Paises:** {' '.join([FLAGS[c] for c in paises_cod])}")
 
-# ── KPIs ─────────────────────────────────────────────────────────────────────
-precio_medio      = df[price_col].mean()
-precio_max        = df[price_col].max()
-precio_min        = df[price_col].min()
-coste_medio_total = df["coste_total_eur_mwh"].mean()
-horas_negativas   = (df[price_col] < 0).sum()
-horas_pico        = (df[price_col] > umbral_alto).sum()
+# ════════════════════════════════════════════════════════
+#  TABS PRINCIPALES
+# ════════════════════════════════════════════════════════
+tab_mercado, tab_europa, tab_ev, tab_alertas = st.tabs([
+    "📈 Mercado Iberico",
+    "🌍 Comparativa Europea",
+    "🔋 Optimizacion EV",
+    "🚨 Alertas",
+])
 
-col1, col2, col3, col4, col5, col6 = st.columns(6)
-col1.metric("Precio spot medio",    f"{precio_medio:.1f} €/MWh")
-col2.metric("Coste total medio",    f"{coste_medio_total:.1f} €/MWh",
-            help="Spot + peajes + cargos + impuestos")
-col3.metric("Precio spot máx.",     f"{precio_max:.1f} €/MWh")
-col4.metric("Precio spot mín.",     f"{precio_min:.1f} €/MWh")
-col5.metric("Horas precio < 0",     f"{horas_negativas}h")
-col6.metric("Horas pico > umbral",  f"{horas_pico}h")
+# ────────────────────────────────────────────────────────
+#  TAB 1 — MERCADO IBERICO
+# ────────────────────────────────────────────────────────
+with tab_mercado:
 
-st.markdown("---")
+    # KPIs
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Spot medio",       f"{df_omie[price_col].mean():.1f} €/MWh")
+    k2.metric("Spot maximo",      f"{df_omie[price_col].max():.1f} €/MWh")
+    k3.metric("Spot minimo",      f"{df_omie[price_col].min():.1f} €/MWh")
+    k4.metric("Coste total medio",f"{df_omie['coste_total'].mean():.1f} €/MWh",
+              help="Spot + peajes + cargos + IVA")
+    k5.metric("Horas precio < 0", f"{(df_omie[price_col] < 0).sum()}h")
 
-# ── Gráfico precios hora a hora: spot vs coste total ─────────────────────────
-st.subheader("📈 Precio spot vs Coste total (con peajes e impuestos)")
-fig_line = go.Figure()
+    st.markdown("---")
 
-fig_line.add_hrect(y0=df[price_col].min() - 5, y1=umbral_bajo,
-                   fillcolor="rgba(0,200,100,0.07)", line_width=0,
-                   annotation_text="Zona valle", annotation_position="top left")
-fig_line.add_hrect(y0=umbral_alto, y1=df["coste_total_eur_mwh"].max() + 5,
-                   fillcolor="rgba(255,50,50,0.07)", line_width=0,
-                   annotation_text="Zona pico", annotation_position="top left")
-
-fig_line.add_trace(go.Scatter(
-    x=df["fecha"], y=df[price_col],
-    mode="lines", name="Spot OMIE",
-    line=dict(color="#4fc3f7", width=1.5),
-    hovertemplate="<b>%{x|%d %b %H:%M}</b><br>OMIE: %{y:.1f} €/MWh<extra></extra>",
-))
-if not df_esios_spot.empty:
-    fig_line.add_trace(go.Scatter(
-        x=df_esios_spot["datetime"], y=df_esios_spot["precio_eur_mwh"],
-        mode="lines", name="Spot ESIOS (REE)",
-        line=dict(color="#ce93d8", width=1.5, dash="dash"),
-        hovertemplate="<b>%{x|%d %b %H:%M}</b><br>ESIOS: %{y:.1f} €/MWh<extra></extra>",
-    ))
-if not df_esios_pvpc.empty:
-    fig_line.add_trace(go.Scatter(
-        x=df_esios_pvpc["datetime"], y=df_esios_pvpc["precio_eur_mwh"],
-        mode="lines", name="PVPC (tarifa regulada)",
-        line=dict(color="#a5d6a7", width=1.5, dash="dot"),
-        hovertemplate="<b>%{x|%d %b %H:%M}</b><br>PVPC: %{y:.1f} €/MWh<extra></extra>",
-    ))
-fig_line.add_trace(go.Scatter(
-    x=df["fecha"], y=df["coste_total_eur_mwh"],
-    mode="lines", name="Coste total (spot+peajes+IVA)",
-    line=dict(color="#ffb74d", width=1.5, dash="dot"),
-    hovertemplate="<b>%{x|%d %b %H:%M}</b><br>Total: %{y:.1f} €/MWh<extra></extra>",
-))
-fig_line.update_layout(
-    height=380, margin=dict(l=0, r=0, t=10, b=0),
-    xaxis_title=None, yaxis_title="EUR/MWh",
-    hovermode="x unified", template="plotly_dark",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02),
-)
-st.plotly_chart(fig_line, use_container_width=True)
-
-# ── Desglose de costes ───────────────────────────────────────────────────────
-with st.expander("📊 Ver desglose de costes del sistema", expanded=False):
-    spot_rep   = precio_medio
-    base_rep   = spot_rep + peaje_acceso + cargos_sistema
-    con_ie_rep = base_rep * (1 + imp_electrico / 100)
-    total_rep  = con_ie_rep * (1 + iva / 100)
-
-    dc1, dc2, dc3, dc4, dc5 = st.columns(5)
-    dc1.metric("Precio spot",        f"{spot_rep:.1f} €/MWh",   f"{spot_rep/total_rep*100:.0f}% del total")
-    dc2.metric("Peaje de acceso",    f"{peaje_acceso:.1f} €/MWh", f"{peaje_acceso/total_rep*100:.0f}%")
-    dc3.metric("Cargos del sistema", f"{cargos_sistema:.1f} €/MWh", f"{cargos_sistema/total_rep*100:.0f}%")
-    dc4.metric("Imp. eléctrico",     f"{base_rep*(imp_electrico/100):.1f} €/MWh", f"{imp_electrico:.2f}%")
-    dc5.metric("IVA",                f"{con_ie_rep*(iva/100):.1f} €/MWh",  f"{iva:.0f}%")
-
-    st.markdown(f"**Coste total medio del período: `{total_rep:.1f} €/MWh` · `{total_rep/1000:.4f} €/kWh`**")
-    st.caption("Nota: el impuesto eléctrico y el IVA se aplican sobre spot + peajes + cargos. "
-               "Los precios negativos no reducen peajes ni cargos regulados.")
-
-# ── Heatmap ──────────────────────────────────────────────────────────────────
-tab_heat1, tab_heat2 = st.tabs(["🗓️ Heatmap precio spot", "🗓️ Heatmap coste total"])
-with tab_heat1:
-    pivot = df.pivot_table(index="hora_num", columns="dia", values=price_col, aggfunc="mean")
-    fig_h = px.imshow(pivot, labels=dict(x="Día", y="Hora", color="€/MWh"),
-                      color_continuous_scale="RdYlGn_r", aspect="auto", template="plotly_dark")
-    fig_h.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0))
-    fig_h.update_xaxes(tickformat="%d %b")
-    st.plotly_chart(fig_h, use_container_width=True)
-with tab_heat2:
-    pivot2 = df.pivot_table(index="hora_num", columns="dia", values="coste_total_eur_mwh", aggfunc="mean")
-    fig_h2 = px.imshow(pivot2, labels=dict(x="Día", y="Hora", color="€/MWh"),
-                       color_continuous_scale="RdYlGn_r", aspect="auto", template="plotly_dark")
-    fig_h2.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0))
-    fig_h2.update_xaxes(tickformat="%d %b")
-    st.plotly_chart(fig_h2, use_container_width=True)
-
-# ── Perfil horario + análisis EV ─────────────────────────────────────────────
-st.markdown("---")
-col_a, col_b = st.columns(2)
-
-with col_a:
-    st.subheader("🕐 Perfil horario medio")
-    hourly = df.groupby("hora_num").agg(
-        spot     = (price_col, "mean"),
-        total    = ("coste_total_eur_mwh", "mean"),
-    ).reset_index().rename(columns={"hora_num": "Hora"})
-
-    fig_bar = go.Figure()
-    colors_spot = ["#ef5350" if p > umbral_alto else "#66bb6a" if p < umbral_bajo else "#4fc3f7"
-                   for p in hourly["spot"]]
-    fig_bar.add_trace(go.Bar(
-        x=hourly["Hora"], y=hourly["spot"],
-        name="Precio spot", marker_color=colors_spot,
-        hovertemplate="Hora %{x}h — Spot: %{y:.1f} €/MWh<extra></extra>",
-    ))
-    fig_bar.add_trace(go.Scatter(
-        x=hourly["Hora"], y=hourly["total"],
-        name="Coste total", mode="lines+markers",
-        line=dict(color="#ffb74d", width=2),
-        hovertemplate="Hora %{x}h — Total: %{y:.1f} €/MWh<extra></extra>",
-    ))
-    fig_bar.update_layout(
-        height=340, template="plotly_dark",
-        margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_title="Hora del día", yaxis_title="EUR/MWh",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        barmode="overlay",
-    )
-    st.plotly_chart(fig_bar, use_container_width=True)
-
-with col_b:
-    st.subheader(f"🔋 Optimización carga EV ({kwh_sesion:.0f} kWh/sesión)")
-
-    hourly["coste_sesion_spot_eur"]  = hourly["spot"].apply(lambda x: max(x, 0)) / 1000 * kwh_sesion
-    hourly["coste_sesion_total_eur"] = hourly["total"] / 1000 * kwh_sesion
-
-    hourly_sorted = hourly.sort_values("total")
-    mejores = hourly_sorted.head(6)
-    peores  = hourly_sorted.tail(6)
-
-    coste_valle_total = mejores["coste_sesion_total_eur"].mean()
-    coste_punta_total = peores["coste_sesion_total_eur"].mean()
-    ahorro_pct = (coste_punta_total - coste_valle_total) / coste_punta_total * 100 if coste_punta_total > 0 else 0
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Coste sesión valle",  f"{coste_valle_total:.2f} €", help="Coste total en horas baratas")
-    m2.metric("Coste sesión punta",  f"{coste_punta_total:.2f} €", help="Coste total en horas caras")
-    m3.metric("Ahorro potencial",    f"{ahorro_pct:.0f}%")
-
-    st.markdown("**Mejores horas para cargar:**")
-    st.success("⚡ " + ", ".join([f"{int(h)}h" for h in mejores["Hora"].tolist()]))
-    st.markdown("**Horas a evitar:**")
-    st.error("⛔ " + ", ".join([f"{int(h)}h" for h in peores["Hora"].tolist()]))
-
-    tabla = hourly[["Hora", "spot", "total", "coste_sesion_total_eur"]].sort_values("Hora").copy()
-    tabla.columns = ["Hora", "Spot (€/MWh)", "Coste total (€/MWh)", f"Sesión {kwh_sesion:.0f}kWh (€)"]
-    tabla = tabla.round(2)
-    st.dataframe(tabla, use_container_width=True, hide_index=True, height=210)
-
-# ── Alertas ──────────────────────────────────────────────────────────────────
-st.markdown("---")
-st.subheader("🚨 Alertas del período")
-alerts_path = Path(__file__).parent.parent / "data" / "processed" / "alerts_log.json"
-if alerts_path.exists():
-    with open(alerts_path) as f:
-        alerts = json.load(f)
-    if alerts:
-        df_alerts = pd.DataFrame(alerts)
-        df_alerts["timestamp"] = pd.to_datetime(df_alerts["timestamp"]).dt.strftime("%d/%m %H:%M")
-        altas = df_alerts[df_alerts["nivel"] == "high"]
-        opps  = df_alerts[df_alerts["nivel"] == "opportunity"]
-        tab1, tab2 = st.tabs([f"Críticas ({len(altas)})", f"Oportunidades ({len(opps)})"])
-        with tab1:
-            st.dataframe(altas[["timestamp", "tipo", "mensaje"]].rename(
-                columns={"timestamp": "Hora", "tipo": "Tipo", "mensaje": "Detalle"}),
-                use_container_width=True, hide_index=True)
-        with tab2:
-            st.dataframe(opps[["timestamp", "tipo", "mensaje"]].rename(
-                columns={"timestamp": "Hora", "tipo": "Tipo", "mensaje": "Detalle"}),
-                use_container_width=True, hide_index=True)
-    else:
-        st.info("Sin alertas en el período.")
-else:
-    st.info("Ejecuta primero `python main.py --mode omie` para generar alertas.")
-
-
-# ── Sección ESIOS: Spot REE + PVPC ───────────────────────────────────────────
-st.markdown("---")
-st.subheader("🔌 ESIOS (REE) — Precio Spot y PVPC")
-
-if not tiene_esios:
-    st.info("Sin datos ESIOS. Ejecuta `python refresh_data.py` para descargarlos.")
-else:
-    # KPIs ESIOS
-    kpi_cols = st.columns(4)
-    if not df_esios_spot.empty:
-        kpi_cols[0].metric("Spot ESIOS medio", f"{df_esios_spot['precio_eur_mwh'].mean():.1f} €/MWh")
-        kpi_cols[1].metric("Spot ESIOS máx.",  f"{df_esios_spot['precio_eur_mwh'].max():.1f} €/MWh")
-    if not df_esios_pvpc.empty:
-        kpi_cols[2].metric("PVPC medio",       f"{df_esios_pvpc['precio_eur_mwh'].mean():.1f} €/MWh")
-        kpi_cols[3].metric("PVPC máx.",        f"{df_esios_pvpc['precio_eur_mwh'].max():.1f} €/MWh")
-
-    # Gráfico PVPC vs Spot OMIE vs Spot ESIOS
-    fig_esios = go.Figure()
-    fig_esios.add_trace(go.Scatter(
-        x=df["fecha"], y=df[price_col],
-        mode="lines", name="Spot OMIE",
-        line=dict(color="#4fc3f7", width=1.5),
-        hovertemplate="OMIE %{x|%d %b %H:%M}: %{y:.1f} €/MWh<extra></extra>",
+    # Grafico principal: todas las series disponibles
+    st.markdown("#### Evolucion de precios")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df_omie["fecha"], y=df_omie[price_col],
+        name="Spot OMIE", line=dict(color="#4fc3f7", width=1.5),
+        hovertemplate="%{x|%d %b %H:%M} — OMIE: %{y:.1f} €/MWh<extra></extra>",
     ))
     if not df_esios_spot.empty:
-        fig_esios.add_trace(go.Scatter(
+        fig.add_trace(go.Scatter(
             x=df_esios_spot["datetime"], y=df_esios_spot["precio_eur_mwh"],
-            mode="lines", name="Spot ESIOS (REE)",
-            line=dict(color="#ce93d8", width=1.5, dash="dash"),
-            hovertemplate="ESIOS %{x|%d %b %H:%M}: %{y:.1f} €/MWh<extra></extra>",
+            name="Spot ESIOS (REE)", line=dict(color="#ce93d8", width=1.5, dash="dash"),
+            hovertemplate="%{x|%d %b %H:%M} — ESIOS: %{y:.1f} €/MWh<extra></extra>",
         ))
     if not df_esios_pvpc.empty:
-        fig_esios.add_trace(go.Scatter(
+        fig.add_trace(go.Scatter(
             x=df_esios_pvpc["datetime"], y=df_esios_pvpc["precio_eur_mwh"],
-            mode="lines", name="PVPC (tarifa regulada)",
-            line=dict(color="#a5d6a7", width=2),
-            hovertemplate="PVPC %{x|%d %b %H:%M}: %{y:.1f} €/MWh<extra></extra>",
+            name="PVPC (tarifa regulada)", line=dict(color="#a5d6a7", width=2),
+            hovertemplate="%{x|%d %b %H:%M} — PVPC: %{y:.1f} €/MWh<extra></extra>",
         ))
-    fig_esios.update_layout(
-        height=360, margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_title=None, yaxis_title="EUR/MWh",
-        hovermode="x unified", template="plotly_dark",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-    )
-    st.plotly_chart(fig_esios, use_container_width=True)
+    fig.add_trace(go.Scatter(
+        x=df_omie["fecha"], y=df_omie["coste_total"],
+        name="Coste total (c/impuestos)", line=dict(color="#ffb74d", width=1.5, dash="dot"),
+        hovertemplate="%{x|%d %b %H:%M} — Total: %{y:.1f} €/MWh<extra></extra>",
+    ))
+    fig.update_layout(height=380, template="plotly_dark", hovermode="x unified",
+                      margin=dict(l=0, r=0, t=10, b=0), yaxis_title="EUR/MWh",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Tabla comparativa horaria PVPC vs Spot OMIE
+    # Heatmap + perfil horario en columnas
+    col_heat, col_bar = st.columns(2)
+    with col_heat:
+        st.markdown("#### Heatmap spot por hora y dia")
+        pivot = df_omie.pivot_table(index="hora_num", columns="dia", values=price_col, aggfunc="mean")
+        fh = px.imshow(pivot, labels=dict(x="Dia", y="Hora", color="EUR/MWh"),
+                       color_continuous_scale="RdYlGn_r", aspect="auto", template="plotly_dark")
+        fh.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0))
+        fh.update_xaxes(tickformat="%d %b")
+        st.plotly_chart(fh, use_container_width=True)
+
+    with col_bar:
+        st.markdown("#### Perfil horario medio")
+        hourly = df_omie.groupby("hora_num")[price_col].mean().reset_index()
+        colors = ["#ef5350" if p > 150 else "#66bb6a" if p < 20 else "#4fc3f7"
+                  for p in hourly[price_col]]
+        fb = go.Figure(go.Bar(x=hourly["hora_num"], y=hourly[price_col],
+                              marker_color=colors,
+                              hovertemplate="Hora %{x}h: %{y:.1f} EUR/MWh<extra></extra>"))
+        fb.update_layout(height=320, template="plotly_dark",
+                         margin=dict(l=0, r=0, t=10, b=0),
+                         xaxis_title="Hora", yaxis_title="EUR/MWh")
+        st.plotly_chart(fb, use_container_width=True)
+
+    # Desglose de costes
+    with st.expander("Ver desglose de costes del sistema"):
+        s = df_omie[price_col].mean()
+        base  = s + peaje_acceso + cargos_sistema
+        c_ie  = base * imp_electrico / 100
+        total = (base + c_ie) * (1 + iva / 100)
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("Precio spot",        f"{s:.1f} €/MWh",           f"{s/total*100:.0f}%")
+        d2.metric("Peaje de acceso",    f"{peaje_acceso:.1f} €/MWh", f"{peaje_acceso/total*100:.0f}%")
+        d3.metric("Cargos del sistema", f"{cargos_sistema:.1f} €/MWh",f"{cargos_sistema/total*100:.0f}%")
+        d4.metric("Imp. electrico",     f"{c_ie:.1f} €/MWh",         f"{imp_electrico:.2f}%")
+        d5.metric("IVA",                f"{(base+c_ie)*iva/100:.1f} €/MWh", f"{iva:.0f}%")
+        st.info(f"**Coste total medio: {total:.1f} EUR/MWh  ·  {total/1000:.4f} EUR/kWh**")
+
+    # PVPC vs Spot
     if not df_esios_pvpc.empty:
-        st.markdown("**Comparativa horaria: PVPC vs Spot OMIE**")
-        df_esios_pvpc_h = df_esios_pvpc.copy()
-        df_esios_pvpc_h["hora"] = df_esios_pvpc_h["datetime"].dt.hour
-        pvpc_horario = df_esios_pvpc_h.groupby("hora")["precio_eur_mwh"].mean().reset_index()
-        pvpc_horario.columns = ["Hora", "PVPC medio (€/MWh)"]
+        st.markdown("---")
+        st.markdown("#### PVPC vs Spot OMIE — comparativa horaria")
+        pvpc_h = (df_esios_pvpc.copy()
+                  .assign(hora=lambda x: x["datetime"].dt.hour)
+                  .groupby("hora")["precio_eur_mwh"].mean().reset_index())
+        omie_h = df_omie.groupby("hora_num")[price_col].mean().reset_index()
+        omie_h.columns = ["hora", "spot"]
+        comp = pvpc_h.merge(omie_h, on="hora").rename(columns={"precio_eur_mwh": "pvpc"})
+        comp["diferencia"] = (comp["pvpc"] - comp["spot"]).round(2)
 
-        omie_horario = df.groupby("hora_num")[price_col].mean().reset_index()
-        omie_horario.columns = ["Hora", "Spot OMIE (€/MWh)"]
+        p1, p2, p3 = st.columns(3)
+        p1.metric("PVPC medio", f"{comp['pvpc'].mean():.1f} EUR/MWh")
+        p2.metric("Spot OMIE medio", f"{comp['spot'].mean():.1f} EUR/MWh")
+        p3.metric("Diferencia media PVPC-Spot", f"{comp['diferencia'].mean():+.1f} EUR/MWh")
 
-        tabla_comp = pvpc_horario.merge(omie_horario, on="Hora")
-        tabla_comp["Diferencia PVPC-OMIE"] = (tabla_comp["PVPC medio (€/MWh)"] - tabla_comp["Spot OMIE (€/MWh)"]).round(2)
-        tabla_comp["PVPC medio (€/MWh)"]  = tabla_comp["PVPC medio (€/MWh)"].round(2)
-        tabla_comp["Spot OMIE (€/MWh)"]   = tabla_comp["Spot OMIE (€/MWh)"].round(2)
+        fig_pvpc = go.Figure()
+        fig_pvpc.add_trace(go.Bar(x=comp["hora"], y=comp["diferencia"],
+            name="PVPC - Spot",
+            marker_color=["#ef5350" if d > 0 else "#66bb6a" for d in comp["diferencia"]],
+            hovertemplate="Hora %{x}h: %{y:+.1f} EUR/MWh<extra></extra>"))
+        fig_pvpc.update_layout(height=260, template="plotly_dark",
+                               margin=dict(l=0, r=0, t=10, b=0),
+                               xaxis_title="Hora", yaxis_title="PVPC - Spot (EUR/MWh)",
+                               showlegend=False)
+        st.plotly_chart(fig_pvpc, use_container_width=True)
+        st.caption("Rojo = PVPC mas caro que el mercado spot. Verde = PVPC mas barato.")
 
-        col_t1, col_t2 = st.columns([2, 1])
-        with col_t1:
-            st.dataframe(tabla_comp, use_container_width=True, hide_index=True, height=280)
-        with col_t2:
-            diff_media = tabla_comp["Diferencia PVPC-OMIE"].mean()
-            st.metric("Diferencia media PVPC vs Spot",
-                      f"{diff_media:+.1f} €/MWh",
-                      help="Positivo = PVPC más caro que el spot de mercado")
-            pvpc_kwh = df_esios_pvpc["precio_eur_mwh"].mean() / 1000
-            st.metric("PVPC medio en €/kWh", f"{pvpc_kwh:.4f} €/kWh")
-            coste_pvpc_sesion = pvpc_kwh * kwh_sesion
-            st.metric(f"Coste sesión EV ({kwh_sesion:.0f} kWh) a PVPC",
-                      f"{coste_pvpc_sesion:.2f} €")
-
-# ── Comparativa ENTSO-E: ES / FR / DE ────────────────────────────────────────
-st.markdown("---")
-st.subheader("🌍 Comparativa de precios europeos — ENTSO-E (ES / FR / DE)")
-
-from config.settings import ENTSOE_TOKEN
-
-if not ENTSOE_TOKEN:
-    st.info("🔑 Token ENTSO-E no configurado. Añádelo en los **Secrets** de Streamlit Cloud para activar esta sección.")
-else:
-    @st.cache_data(ttl=3600)
-    def load_entsoe(days: int) -> pd.DataFrame:
-        today = date.today()
-        start = today - timedelta(days=days)
-        end   = today - timedelta(days=1)
-        try:
-            return get_iberian_comparison(start, end)
-        except Exception as e:
-            return pd.DataFrame()
-
-    with st.spinner("Cargando datos ENTSO-E (ES/FR/DE)..."):
-        df_entsoe = load_entsoe(days)
-
-    if df_entsoe.empty:
-        st.warning("No se pudieron obtener datos de ENTSO-E para este período.")
+# ────────────────────────────────────────────────────────
+#  TAB 2 — COMPARATIVA EUROPEA
+# ────────────────────────────────────────────────────────
+with tab_europa:
+    if not ENTSOE_TOKEN:
+        st.info("Token ENTSO-E no configurado. Añadelo en los Secrets de Streamlit Cloud.")
+    elif df_entsoe.empty:
+        st.warning("No se pudieron obtener datos de ENTSO-E (servidor no disponible). Intentalo mas tarde.")
     else:
-        df_entsoe["datetime"] = pd.to_datetime(df_entsoe["datetime"])
-        df_entsoe["hora_num"] = df_entsoe["datetime"].dt.hour
+        paises_disp = df_entsoe["country"].unique().tolist()
 
-        COLORES = {"ES": "#4fc3f7", "FR": "#81c784", "DE": "#ffb74d"}
+        # KPIs por pais
+        stats = df_entsoe.groupby("country")["precio_eur_mwh"].agg(["mean","min","max"]).round(1)
+        cols_kpi = st.columns(len(paises_disp))
+        for i, pais in enumerate(paises_disp):
+            if pais in stats.index:
+                r = stats.loc[pais]
+                cols_kpi[i].metric(
+                    f"{FLAGS.get(pais,'')} {pais} — Media",
+                    f"{r['mean']:.1f} EUR/MWh",
+                    f"Min {r['min']:.1f}  ·  Max {r['max']:.1f}",
+                )
 
-        # ── KPIs por país ─────────────────────────────────────────────────────
-        stats = df_entsoe.groupby("country")["precio_eur_mwh"].agg(["mean", "min", "max"]).round(1)
-        cols = st.columns(len(stats))
-        for i, (pais, row) in enumerate(stats.iterrows()):
-            flag = {"ES": "🇪🇸", "FR": "🇫🇷", "DE": "🇩🇪"}.get(pais, "")
-            cols[i].metric(f"{flag} {pais} — Precio medio", f"{row['mean']:.1f} €/MWh",
-                           f"Min {row['min']:.1f} · Max {row['max']:.1f}")
+        st.markdown("---")
 
-        # ── Gráfico líneas comparativo ─────────────────────────────────────────
+        # Grafico lineas comparativo
+        st.markdown("#### Evolucion de precios por pais")
         fig_eu = go.Figure()
         for pais, grp in df_entsoe.groupby("country"):
-            grp_sorted = grp.sort_values("datetime")
             fig_eu.add_trace(go.Scatter(
-                x=grp_sorted["datetime"],
-                y=grp_sorted["precio_eur_mwh"],
-                mode="lines", name=pais,
+                x=grp.sort_values("datetime")["datetime"],
+                y=grp.sort_values("datetime")["precio_eur_mwh"],
+                name=f"{FLAGS.get(pais,'')} {pais}",
                 line=dict(color=COLORES.get(pais, "#fff"), width=1.5),
-                hovertemplate=f"<b>{pais}</b> %{{x|%d %b %H:%M}}<br>%{{y:.1f}} €/MWh<extra></extra>",
+                hovertemplate=f"{pais} %{{x|%d %b %H:%M}}: %{{y:.1f}} EUR/MWh<extra></extra>",
             ))
-        fig_eu.update_layout(
-            height=360, margin=dict(l=0, r=0, t=10, b=0),
-            xaxis_title=None, yaxis_title="EUR/MWh",
-            hovermode="x unified", template="plotly_dark",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        )
+        fig_eu.update_layout(height=360, template="plotly_dark", hovermode="x unified",
+                             margin=dict(l=0, r=0, t=10, b=0), yaxis_title="EUR/MWh",
+                             legend=dict(orientation="h", yanchor="bottom", y=1.02))
         st.plotly_chart(fig_eu, use_container_width=True)
 
-        # ── Perfil horario medio por país ──────────────────────────────────────
         col_eu1, col_eu2 = st.columns(2)
-
         with col_eu1:
-            st.markdown("**Perfil horario medio por país**")
-            hourly_eu = df_entsoe.groupby(["country", "hora_num"])["precio_eur_mwh"].mean().reset_index()
+            st.markdown("#### Perfil horario medio por pais")
+            hourly_eu = df_entsoe.groupby(["country","hora_num"])["precio_eur_mwh"].mean().reset_index()
             fig_heu = go.Figure()
             for pais, grp in hourly_eu.groupby("country"):
                 fig_heu.add_trace(go.Scatter(
                     x=grp["hora_num"], y=grp["precio_eur_mwh"],
-                    mode="lines+markers", name=pais,
-                    line=dict(color=COLORES.get(pais, "#fff"), width=2),
-                    hovertemplate=f"{pais} hora %{{x}}h: %{{y:.1f}} €/MWh<extra></extra>",
+                    name=f"{FLAGS.get(pais,'')} {pais}",
+                    line=dict(color=COLORES.get(pais,"#fff"), width=2),
+                    mode="lines+markers",
+                    hovertemplate=f"{pais} hora %{{x}}h: %{{y:.1f}} EUR/MWh<extra></extra>",
                 ))
-            fig_heu.update_layout(
-                height=300, template="plotly_dark",
-                margin=dict(l=0, r=0, t=10, b=0),
-                xaxis_title="Hora del día", yaxis_title="EUR/MWh",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            )
+            fig_heu.update_layout(height=320, template="plotly_dark",
+                                  margin=dict(l=0, r=0, t=10, b=0),
+                                  xaxis_title="Hora del dia", yaxis_title="EUR/MWh",
+                                  legend=dict(orientation="h", yanchor="bottom", y=1.02))
             st.plotly_chart(fig_heu, use_container_width=True)
 
         with col_eu2:
-            st.markdown("**Tabla resumen por país**")
-            resumen = df_entsoe.groupby("country")["precio_eur_mwh"].agg(
-                Media="mean", Mínimo="min", Máximo="max",
-                Volatilidad="std",
-                Horas_negativas=lambda x: (x < 0).sum(),
-            ).round(1).reset_index()
-            resumen.columns = ["País", "Media (€/MWh)", "Mín.", "Máx.", "Volatilidad", "Horas < 0€"]
-            resumen["País"] = resumen["País"].map({"ES": "🇪🇸 España", "FR": "🇫🇷 Francia", "DE": "🇩🇪 Alemania"})
+            st.markdown("#### Resumen y diferenciales")
+            resumen = stats.reset_index()
+            resumen.columns = ["Pais", "Media", "Minimo", "Maximo"]
+            resumen["Pais"] = resumen["Pais"].map(
+                lambda x: f"{FLAGS.get(x,'')} {x}")
+            resumen["Volatilidad"] = (df_entsoe.groupby("country")["precio_eur_mwh"]
+                                      .std().round(1).values)
+            resumen["Horas < 0"] = (df_entsoe[df_entsoe["precio_eur_mwh"] < 0]
+                                    .groupby("country").size().reindex(
+                                    resumen["Pais"].str[-2:]).fillna(0).astype(int).values)
             st.dataframe(resumen, use_container_width=True, hide_index=True)
 
-            # Diferencial ES vs FR y DE
-            st.markdown("**Diferencial ES respecto a vecinos**")
-            if "ES" in stats.index and "FR" in stats.index:
-                diff_fr = stats.loc["ES", "mean"] - stats.loc["FR", "mean"]
-                arrow_fr = "↑ más caro" if diff_fr > 0 else "↓ más barato"
-                st.markdown(f"- ES vs FR: `{diff_fr:+.1f} €/MWh` ({arrow_fr})")
-            if "ES" in stats.index and "DE" in stats.index:
-                diff_de = stats.loc["ES", "mean"] - stats.loc["DE", "mean"]
-                arrow_de = "↑ más caro" if diff_de > 0 else "↓ más barato"
-                st.markdown(f"- ES vs DE: `{diff_de:+.1f} €/MWh` ({arrow_de})")
+            st.markdown("**Diferencial respecto a España 🇪🇸**")
+            if "ES" in stats.index:
+                for pais in [p for p in paises_disp if p != "ES"]:
+                    if pais in stats.index:
+                        diff = stats.loc["ES","mean"] - stats.loc[pais,"mean"]
+                        txt  = "mas caro" if diff > 0 else "mas barato"
+                        st.markdown(f"- ES vs {FLAGS.get(pais,'')} {pais}: "
+                                    f"`{diff:+.1f} EUR/MWh` ({txt})")
 
+        # Heatmap por pais
+        st.markdown("#### Heatmap de precios por pais")
+        for pais in paises_disp:
+            grp = df_entsoe[df_entsoe["country"] == pais].copy()
+            grp["dia"] = grp["datetime"].dt.date
+            pivot_eu = grp.pivot_table(index="hora_num", columns="dia",
+                                       values="precio_eur_mwh", aggfunc="mean")
+            fig_hmap = px.imshow(pivot_eu,
+                labels=dict(x="Dia", y="Hora", color="EUR/MWh"),
+                color_continuous_scale="RdYlGn_r", aspect="auto", template="plotly_dark",
+                title=f"{FLAGS.get(pais,'')} {pais}")
+            fig_hmap.update_layout(height=280, margin=dict(l=0, r=0, t=30, b=0))
+            fig_hmap.update_xaxes(tickformat="%d %b")
+            st.plotly_chart(fig_hmap, use_container_width=True)
+
+# ────────────────────────────────────────────────────────
+#  TAB 3 — OPTIMIZACION EV
+# ────────────────────────────────────────────────────────
+with tab_ev:
+    st.markdown(f"### Analisis de coste de carga EV — {kwh_sesion:.0f} kWh por sesion")
+
+    hourly = df_omie.groupby("hora_num").agg(
+        spot    =(price_col, "mean"),
+        total   =("coste_total", "mean"),
+    ).reset_index().rename(columns={"hora_num": "Hora"})
+    hourly["coste_spot_eur"]  = hourly["spot"].apply(lambda x: max(x,0)) / 1000 * kwh_sesion
+    hourly["coste_total_eur"] = hourly["total"] / 1000 * kwh_sesion
+
+    hourly_sorted = hourly.sort_values("total")
+    mejores = hourly_sorted.head(6)
+    peores  = hourly_sorted.tail(6)
+    ahorro  = peores["coste_total_eur"].mean() - mejores["coste_total_eur"].mean()
+    pct     = ahorro / peores["coste_total_eur"].mean() * 100 if peores["coste_total_eur"].mean() > 0 else 0
+
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Coste sesion en horas valle", f"{mejores['coste_total_eur'].mean():.2f} EUR")
+    e2.metric("Coste sesion en horas punta", f"{peores['coste_total_eur'].mean():.2f} EUR")
+    e3.metric("Ahorro por sesion",           f"{ahorro:.2f} EUR")
+    e4.metric("Ahorro potencial",            f"{pct:.0f}%")
+
+    st.markdown("---")
+    col_ev1, col_ev2 = st.columns(2)
+
+    with col_ev1:
+        st.markdown("#### Coste de sesion EV por hora")
+        colors_ev = ["#66bb6a" if h in mejores["Hora"].values else
+                     "#ef5350" if h in peores["Hora"].values else "#90a4ae"
+                     for h in hourly["Hora"]]
+        fig_ev = go.Figure(go.Bar(
+            x=hourly["Hora"], y=hourly["coste_total_eur"],
+            marker_color=colors_ev,
+            hovertemplate="Hora %{x}h: %{y:.2f} EUR/sesion<extra></extra>",
+        ))
+        fig_ev.update_layout(height=340, template="plotly_dark",
+                             margin=dict(l=0, r=0, t=10, b=0),
+                             xaxis_title="Hora", yaxis_title=f"EUR / {kwh_sesion:.0f} kWh")
+        st.plotly_chart(fig_ev, use_container_width=True)
+        st.success("Verde = mejores horas para cargar")
+        st.error("Rojo = horas a evitar")
+
+    with col_ev2:
+        st.markdown("#### Tabla completa por hora")
+        tabla = hourly[["Hora","spot","total","coste_spot_eur","coste_total_eur"]].copy()
+        tabla.columns = ["Hora","Spot (EUR/MWh)","Total c/reg (EUR/MWh)",
+                         f"Sesion solo spot (EUR)","Sesion con reg. (EUR)"]
+        tabla = tabla.round(2).sort_values("Hora")
+        st.dataframe(tabla, use_container_width=True, hide_index=True, height=380)
+
+    # PVPC como alternativa
+    if not df_esios_pvpc.empty:
+        st.markdown("---")
+        st.markdown("#### Alternativa: tarifa PVPC")
+        pvpc_medio = df_esios_pvpc["precio_eur_mwh"].mean()
+        coste_pvpc = pvpc_medio / 1000 * kwh_sesion
+        coste_valle = mejores["coste_total_eur"].mean()
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Coste sesion a PVPC",    f"{coste_pvpc:.2f} EUR",
+                  help="PVPC incluye todos los costes regulados")
+        p2.metric("Coste sesion en valle",  f"{coste_valle:.2f} EUR")
+        p3.metric("Diferencia PVPC vs valle", f"{coste_pvpc - coste_valle:+.2f} EUR",
+                  delta_color="inverse")
+
+# ────────────────────────────────────────────────────────
+#  TAB 4 — ALERTAS
+# ────────────────────────────────────────────────────────
+with tab_alertas:
+    alerts_path = Path(__file__).parent.parent / "data" / "processed" / "alerts_log.json"
+    if not alerts_path.exists():
+        st.info("Sin alertas generadas aun. Ejecuta `python main.py --mode omie` localmente.")
+    else:
+        with open(alerts_path) as f:
+            alerts = json.load(f)
+        if not alerts:
+            st.success("Sin alertas en el periodo analizado.")
+        else:
+            df_al = pd.DataFrame(alerts)
+            df_al["timestamp"] = pd.to_datetime(df_al["timestamp"]).dt.strftime("%d/%m %H:%M")
+            altas = df_al[df_al["nivel"] == "high"]
+            opps  = df_al[df_al["nivel"] == "opportunity"]
+            infos = df_al[df_al["nivel"] == "info"]
+
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Criticas",     len(altas))
+            a2.metric("Oportunidades",len(opps))
+            a3.metric("Informativas", len(infos))
+
+            t1, t2, t3 = st.tabs([
+                f"Criticas ({len(altas)})",
+                f"Oportunidades ({len(opps)})",
+                f"Informativas ({len(infos)})",
+            ])
+            for tab, subset in [(t1, altas), (t2, opps), (t3, infos)]:
+                with tab:
+                    if subset.empty:
+                        st.info("Sin alertas de este tipo.")
+                    else:
+                        st.dataframe(
+                            subset[["timestamp","tipo","mensaje"]].rename(
+                                columns={"timestamp":"Hora","tipo":"Tipo","mensaje":"Detalle"}),
+                            use_container_width=True, hide_index=True)
+
+# ════════════════════════════════════════════════════════
+#  FOOTER
+# ════════════════════════════════════════════════════════
 st.markdown("---")
-st.caption("Datos: OMIE (mercado ibérico) · ENTSO-E (precios europeos) · "
-           "Peajes y cargos: CNMC 2026 (ajustables en sidebar) · Desarrollado con Streamlit + Plotly")
+st.caption(
+    "Fuentes: OMIE (mercado iberico) · ESIOS/REE · ENTSO-E  |  "
+    "Costes regulados ajustables en el sidebar  |  "
+    "Desarrollado con Streamlit + Plotly"
+)
